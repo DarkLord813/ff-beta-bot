@@ -8,6 +8,7 @@ import threading
 import time
 import requests
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from playwright.async_api import async_playwright
@@ -18,6 +19,8 @@ if not TELEGRAM_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable is not set!")
 
 TARGET_URL = "https://unlockffbeta.com"
+
+# Persistent path on Hugging Face, local file on Render
 DB_NAME = "/data/users.db" if os.path.exists("/data") else "users.db"
 DEFAULT_TIMER_SECONDS = 24 * 60 * 60
 
@@ -169,6 +172,21 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                 "--disable-gpu",
                 "--disable-extensions",
                 "--single-process",
+                "--disable-setuid-sandbox",
+                "--disable-accelerated-2d-canvas",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-breakpad",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--disable-features=TranslateUI",
+                "--disable-ipc-flooding-protection",
+                "--disable-renderer-backgrounding",
+                "--memory-pressure-off",
+                "--max_old_space_size=256",
             ]
         }
         if proxy_url:
@@ -360,24 +378,61 @@ async def post_init(application):
     loop.run_in_executor(None, fetch_and_validate_proxies)
     asyncio.create_task(timer_loop(application))
 
-# --- 7. KEEP-ALIVE (Auto-Detects Hugging Face Space URL) ---
+# --- 7. KEEP-ALIVE (Hugging Face + Render) ---
 def keep_alive():
+    """Pings the hosted URL every 10 minutes to prevent sleeping."""
+    # Hugging Face auto-injects SPACE_HOST
     space_host = os.getenv("SPACE_HOST")
-    if not space_host:
-        logger.info("⚠️ Not on Hugging Face. Keep-alive disabled.")
+    # Render auto-injects RENDER_EXTERNAL_URL
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+
+    url = None
+    if space_host:
+        url = f"https://{space_host}"
+    elif render_url:
+        url = render_url
+
+    if not url:
+        logger.info("⚠️ Not on Hugging Face or Render. Keep-alive disabled.")
         return
-    url = f"https://{space_host}"
+
     logger.info(f"✅ Keep-alive started for: {url}")
+
     while True:
         try:
-            time.sleep(600)
+            time.sleep(600)  # 10 minutes
             r = requests.get(url, timeout=15)
             logger.info(f"Keep-alive ping sent (status: {r.status_code})")
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
 
-# --- 8. MAIN ENTRY POINT ---
+# --- 8. HEALTH CHECK SERVER (For Render Web Service) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Suppress request logging to avoid spam
+
+def run_health_server():
+    """Dummy HTTP server for Render's health checks and keep-alive pings."""
+    port = int(os.getenv("PORT", 8080))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info(f"✅ Health check server running on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.warning(f"Health server failed to start: {e}")
+
+# --- 9. MAIN ENTRY POINT ---
 def main():
+    # Start health check server (needed for Render Web Service)
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Start keep-alive pings
     threading.Thread(target=keep_alive, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()

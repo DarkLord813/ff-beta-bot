@@ -1,18 +1,12 @@
 FROM python:3.11-slim
 
-# --- 1. Create non-root user (required by Hugging Face Spaces) ---
-RUN useradd -m -u 1000 user
+# --- 1. Environment variables ---
+ENV PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# --- 2. Set environment variables ---
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH \
-    PLAYWRIGHT_BROWSERS_PATH=/home/user/.cache/ms-playwright \
-    PYTHONUNBUFFERED=1
+WORKDIR /app
 
-WORKDIR /home/user/app
-
-# --- 3. Install Chromium system dependencies (as root) ---
-USER root
+# --- 2. Install Chromium system dependencies ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     wget gnupg curl \
@@ -23,22 +17,16 @@ RUN apt-get update && \
     fonts-liberation && \
     rm -rf /var/lib/apt/lists/*
 
-# --- 4. Install Python dependencies ---
-COPY --chown=user requirements.txt .
+# --- 3. Install Python dependencies ---
+COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# --- 5. Install Playwright Chromium (with system deps) ---
+# --- 4. Install Playwright Chromium ---
 RUN python -m playwright install --with-deps chromium
 
-# --- 6. Switch to non-root user ---
-USER user
+# --- 5. Copy bot code ---
+COPY . .
 
-# --- 7. Copy bot code ---
-COPY --chown=user . .
-
-# --- 8. Expose Hugging Face's expected port ---
-EXPOSE 7860
-
-# --- 9. Start the bot ---
+# --- 6. Start the bot ---
 CMD ["python", "bot.py"]
