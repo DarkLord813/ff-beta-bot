@@ -19,8 +19,6 @@ if not TELEGRAM_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable is not set!")
 
 TARGET_URL = "https://unlockffbeta.com"
-
-# Persistent path on Hugging Face, local file on Render
 DB_NAME = "/data/users.db" if os.path.exists("/data") else "users.db"
 DEFAULT_TIMER_SECONDS = 24 * 60 * 60
 
@@ -131,17 +129,47 @@ async def close_new_page(page):
     except:
         pass
 
-async def handle_ad_gate(page):
+async def handle_ad_gate(page, step_num):
+    """Handles one ad gate cycle. Returns True if handled, False if no gate appeared."""
     try:
-        await page.wait_for_selector("#adGate:not(.hidden)", timeout=5000)
+        await page.wait_for_selector("#adGate:not(.hidden)", timeout=6000)
+        logger.info(f"[Step {step_num}] Ad gate detected.")
+    except:
+        logger.info(f"[Step {step_num}] No ad gate appeared — skipping.")
+        return False
+
+    # Click "Open Ad"
+    try:
         if await page.is_visible("#adGateOpen"):
             await page.click("#adGateOpen")
-            await page.wait_for_timeout(2000)
-        await page.wait_for_selector("#adGateContinue:not([disabled])", timeout=20000)
+            logger.info(f"[Step {step_num}] Clicked 'Open Ad'.")
+            await page.wait_for_timeout(3000)
+    except Exception as e:
+        logger.warning(f"[Step {step_num}] adGateOpen click failed: {e}")
+
+    # Wait for the "Continue" button to become enabled
+    try:
+        await page.wait_for_selector("#adGateContinue:not([disabled])", timeout=45000)
         await page.click("#adGateContinue")
-        await page.wait_for_timeout(1000)
-    except:
-        pass
+        logger.info(f"[Step {step_num}] Clicked ad gate 'Continue'.")
+        await page.wait_for_timeout(2000)
+    except Exception as e:
+        logger.warning(f"[Step {step_num}] adGateContinue failed: {e}")
+
+    return True
+
+async def click_step_continue(page, step_num):
+    """Clicks the main #btnNext button for the current step."""
+    try:
+        # Wait for btnNext to be enabled and visible
+        await page.wait_for_selector("#btnNext:not([disabled])", timeout=10000)
+        await page.click("#btnNext")
+        logger.info(f"[Step {step_num}] Clicked #btnNext.")
+        await page.wait_for_timeout(2500)
+        return True
+    except Exception as e:
+        logger.warning(f"[Step {step_num}] #btnNext click failed: {e}")
+        return False
 
 def parse_timer_from_text(text):
     if not text:
@@ -209,44 +237,84 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
         context_browser.on("page", lambda np: asyncio.create_task(close_new_page(np)))
 
         try:
+            # --- Initial page load ---
             if progress_message:
-                await update_progress(progress_message, 20, "🌐 Opening website...")
+                await update_progress(progress_message, 10, "🌐 Opening website...")
             await page.goto(TARGET_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2500)
 
+            # --- Enter ID ---
             if progress_message:
-                await update_progress(progress_message, 30, "🖱️ Clicking 'Continue without Discord'...")
-            await page.wait_for_selector("#btnGuest", timeout=10000)
+                await update_progress(progress_message, 20, "🖱️ Clicking 'Continue without Discord'...")
+            await page.wait_for_selector("#btnGuest", timeout=15000)
             await page.click("#btnGuest")
+            await page.wait_for_timeout(1500)
 
             if progress_message:
-                await update_progress(progress_message, 40, f"⌨️ Entering ID: {account_id}")
-            await page.wait_for_selector("#acctInput", timeout=10000)
+                await update_progress(progress_message, 30, f"⌨️ Entering ID: {account_id}")
+            await page.wait_for_selector("#acctInput", timeout=15000)
             await page.fill("#acctInput", account_id)
 
             if progress_message:
-                await update_progress(progress_message, 60, "📤 Submitting ID...")
-            await page.wait_for_selector("#btnStart:not([disabled])", timeout=10000)
+                await update_progress(progress_message, 40, "📤 Submitting ID...")
+            await page.wait_for_selector("#btnStart:not([disabled])", timeout=15000)
             await page.click("#btnStart")
+            await page.wait_for_timeout(2000)
 
-            if progress_message:
-                await update_progress(progress_message, 75, "📺 Handling ad gate...")
-            await handle_ad_gate(page)
+            # --- Multi-step loop (handles up to 5 steps) ---
+            max_steps = 5
+            for step in range(1, max_steps + 1):
+                percent = 40 + (step * 10)
+                if percent > 90:
+                    percent = 90
+                if progress_message:
+                    await update_progress(
+                        progress_message, percent,
+                        f"🎬 Ad step {step}/{max_steps}..."
+                    )
 
+                # Check if we're already unlocked (final screen)
+                try:
+                    unlocked = await page.evaluate(
+                        "() => { const el = document.querySelector('#waitTimerLabel'); "
+                        "return el && el.innerText.includes('Unlocked'); }"
+                    )
+                    if unlocked:
+                        logger.info(f"[Step {step}] Already unlocked! Breaking loop.")
+                        break
+                except:
+                    pass
+
+                # Handle the ad gate for this step
+                await handle_ad_gate(page, step)
+
+                # Click the main "Continue (an ad will open)" button
+                clicked = await click_step_continue(page, step)
+                if not clicked:
+                    logger.info(f"[Step {step}] No more Continue buttons. Assuming done.")
+                    break
+
+                # Wait a moment for next step to load
+                await page.wait_for_timeout(2000)
+
+            # --- Wait for the unlock timer to appear ---
             if progress_message:
-                await update_progress(progress_message, 90, "⏳ Waiting for unlock timer...")
+                await update_progress(progress_message, 95, "⏳ Waiting for unlock timer...")
             await page.wait_for_function(
                 "document.querySelector('#waitTimerLabel') && "
                 "document.querySelector('#waitTimerLabel').innerText.includes('Unlocked')",
-                timeout=30000
+                timeout=60000
             )
+            logger.info("Unlock confirmed.")
 
+            # --- Read the timer ---
             detected_timer = None
             try:
                 await page.wait_for_timeout(2000)
                 if await page.is_visible("#expireCountdown"):
                     timer_text = await page.locator("#expireCountdown").inner_text()
                     detected_timer = parse_timer_from_text(timer_text)
+                    logger.info(f"Detected timer: '{timer_text}' -> {detected_timer}s")
             except Exception as e:
                 logger.warning(f"Could not read timer: {e}")
 
@@ -378,47 +446,38 @@ async def post_init(application):
     loop.run_in_executor(None, fetch_and_validate_proxies)
     asyncio.create_task(timer_loop(application))
 
-# --- 7. KEEP-ALIVE (Hugging Face + Render) ---
+# --- 7. KEEP-ALIVE ---
 def keep_alive():
-    """Pings the hosted URL every 10 minutes to prevent sleeping."""
-    # Hugging Face auto-injects SPACE_HOST
     space_host = os.getenv("SPACE_HOST")
-    # Render auto-injects RENDER_EXTERNAL_URL
     render_url = os.getenv("RENDER_EXTERNAL_URL")
-
     url = None
     if space_host:
         url = f"https://{space_host}"
     elif render_url:
         url = render_url
-
     if not url:
         logger.info("⚠️ Not on Hugging Face or Render. Keep-alive disabled.")
         return
-
     logger.info(f"✅ Keep-alive started for: {url}")
-
     while True:
         try:
-            time.sleep(600)  # 10 minutes
+            time.sleep(600)
             r = requests.get(url, timeout=15)
             logger.info(f"Keep-alive ping sent (status: {r.status_code})")
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
 
-# --- 8. HEALTH CHECK SERVER (For Render Web Service) ---
+# --- 8. HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-
     def log_message(self, format, *args):
-        pass  # Suppress request logging to avoid spam
+        pass
 
 def run_health_server():
-    """Dummy HTTP server for Render's health checks and keep-alive pings."""
     port = int(os.getenv("PORT", 8080))
     try:
         server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
@@ -429,17 +488,14 @@ def run_health_server():
 
 # --- 9. MAIN ENTRY POINT ---
 def main():
-    # Start health check server (needed for Render Web Service)
     threading.Thread(target=run_health_server, daemon=True).start()
-
-    # Start keep-alive pings
     threading.Thread(target=keep_alive, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id))
 
-    print("🤖 Bot running with Progress Bar + Auto Free Proxy Fetcher + Keep-Alive...")
+    print("🤖 Bot running with Multi-Step Ad Handling + Progress Bar...")
     app.run_polling()
 
 if __name__ == "__main__":
