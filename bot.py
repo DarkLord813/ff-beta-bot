@@ -121,7 +121,66 @@ async def update_progress(message, percent, step_text):
     except Exception as e:
         logger.warning(f"Failed to edit progress: {e}")
 
-# --- 4. DEBUG HELPERS ---
+# --- 4. STEALTH PATCHES ---
+async def apply_stealth(page):
+    """Hides common automation fingerprints from anti-bot detection."""
+    try:
+        # Hide navigator.webdriver
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        # Add fake plugins
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+        """)
+
+        # Add fake languages
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+        """)
+
+        # Override chrome runtime
+        await page.add_init_script("""
+            window.chrome = {
+                runtime: {}
+            };
+        """)
+
+        # Override permissions
+        await page.add_init_script("""
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
+
+        # Hide headless user agent features
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8
+            });
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8
+            });
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'Win32'
+            });
+        """)
+
+        logger.info("Stealth patches applied.")
+    except Exception as e:
+        logger.warning(f"Stealth patch error: {e}")
+
+# --- 5. DEBUG HELPERS ---
 async def dump_page_state(page, tag):
     logger.info(f"--- PAGE STATE [{tag}] ---")
     try:
@@ -156,9 +215,17 @@ async def dump_page_state(page, tag):
         btn_next_disabled = await page.get_attribute("#btnNext", "disabled")
         logger.info(f"btnNext visible={btn_next_visible} disabled={btn_next_disabled}")
     except: pass
+    try:
+        btn_guest_visible = await page.is_visible("#btnGuest")
+        logger.info(f"btnGuest visible: {btn_guest_visible}")
+    except: pass
+    try:
+        body = await page.locator("body").inner_text()
+        logger.info(f"Body preview: '{body[:200]}'")
+    except: pass
     logger.info(f"--- END PAGE STATE [{tag}] ---")
 
-# --- 5. AD HANDLING & BROWSER AUTOMATION ---
+# --- 6. AD HANDLING & BROWSER AUTOMATION ---
 async def close_new_page(page):
     try:
         await page.wait_for_timeout(1500)
@@ -213,17 +280,28 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
     async with async_playwright() as p:
         proxy_url = get_random_proxy()
         launch_options = {
-            "headless": True,
+            "headless": False,  # We control headless via --headless=new
             "args": [
-                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-extensions", "--single-process", "--disable-setuid-sandbox",
-                "--disable-accelerated-2d-canvas", "--no-first-run", "--no-zygote",
-                "--disable-background-networking", "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows", "--disable-breakpad",
-                "--disable-component-extensions-with-background-pages", "--disable-default-apps",
-                "--disable-features=TranslateUI", "--disable-ipc-flooding-protection",
-                "--disable-renderer-backgrounding", "--memory-pressure-off",
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-breakpad",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+                "--disable-ipc-flooding-protection",
+                "--disable-renderer-backgrounding",
+                "--memory-pressure-off",
                 "--max_old_space_size=256",
+                "--window-size=360,640",
+                "--lang=en-US,en",
             ]
         }
         if proxy_url:
@@ -233,19 +311,37 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
             logger.info("No proxy — using direct connection.")
 
         try:
-            browser = await p.chromium.launch(**launch_options)
-            logger.info("Browser launched.")
+            browser = await p.chromium.launch(channel="chromium", **launch_options)
+            logger.info("Browser launched with channel=chromium and --headless=new.")
         except Exception as e:
-            logger.error(f"Browser launch failed: {e}")
-            if progress_message:
-                await update_progress(progress_message, 100, "❌ Browser failed to launch")
-            return False, 0
+            logger.error(f"Chromium channel failed: {e}. Falling back to default.")
+            try:
+                browser = await p.chromium.launch(**launch_options)
+                logger.info("Browser launched with default channel.")
+            except Exception as e2:
+                logger.error(f"Browser launch completely failed: {e2}")
+                if progress_message:
+                    await update_progress(progress_message, 100, "❌ Browser failed to launch")
+                return False, 0
 
         context_browser = await browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-            viewport={'width': 360, 'height': 640}
+            viewport={'width': 360, 'height': 640},
+            locale="en-US",
+            timezone_id="Africa/Lagos",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+            }
         )
         page = await context_browser.new_page()
+
+        # Apply stealth patches BEFORE any navigation
+        await apply_stealth(page)
+
         context_browser.on("page", lambda np: asyncio.create_task(close_new_page(np)))
 
         try:
@@ -254,30 +350,55 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                 await update_progress(progress_message, 10, "🌐 Opening website...")
             logger.info("Navigating to site...")
             await page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(4000)
             logger.info("Site loaded.")
             await dump_page_state(page, "after_load")
 
+            # --- Check if page is actually rendered ---
+            try:
+                step1_class = await page.get_attribute("#stepCircle1", "class")
+                if "active" not in (step1_class or ""):
+                    logger.warning("⚠️ Step 1 is NOT active. Page may not have rendered properly.")
+                    logger.warning("This usually means the site detected the bot or blocked the IP.")
+            except: pass
+
             # --- Enter ID ---
             if progress_message:
-                await update_progress(progress_message, 20, "🖱️ Clicking 'Continue without Discord'...")
-            await page.wait_for_selector("#btnGuest", timeout=30000, state="visible")
-            await page.click("#btnGuest")
-            await page.wait_for_timeout(2000)
+                await update_progress(progress_message, 20, "🖱️ Looking for Continue button...")
+            logger.info("Waiting for #btnGuest (up to 45s)...")
+            try:
+                await page.wait_for_selector("#btnGuest", timeout=45000, state="visible")
+                logger.info("Found #btnGuest. Clicking...")
+                await page.click("#btnGuest")
+                logger.info("Clicked #btnGuest.")
+            except Exception as e:
+                logger.error(f"#btnGuest not found: {e}")
+                await dump_page_state(page, "btnGuest_missing")
+                try:
+                    await page.screenshot(path="/tmp/btnGuest_missing.png", full_page=True)
+                    logger.info("Saved screenshot to /tmp/btnGuest_missing.png")
+                except: pass
+                raise Exception(f"#btnGuest not found after 45s")
+
+            await page.wait_for_timeout(2500)
 
             if progress_message:
                 await update_progress(progress_message, 30, f"⌨️ Entering ID: {account_id}")
+            logger.info("Waiting for #acctInput...")
             await page.wait_for_selector("#acctInput", timeout=20000)
             await page.fill("#acctInput", account_id)
+            logger.info(f"Filled #acctInput with {account_id}.")
 
             if progress_message:
                 await update_progress(progress_message, 40, "📤 Submitting ID...")
+            logger.info("Waiting for #btnStart to enable...")
             await page.wait_for_selector("#btnStart:not([disabled])", timeout=20000)
             await page.click("#btnStart")
+            logger.info("Clicked #btnStart.")
             await page.wait_for_timeout(3000)
             await dump_page_state(page, "after_btnStart")
 
-            # --- Multi-step loop: click #btnNext until #resultCard appears ---
+            # --- Multi-step loop ---
             max_steps = 6
             for step in range(1, max_steps + 1):
                 logger.info(f">>>>>>>> STEP {step} <<<<<<<<")
@@ -285,7 +406,6 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                 if progress_message:
                     await update_progress(progress_message, percent, f"🎬 Ad step {step}/{max_steps}...")
 
-                # Check if the final result card is visible
                 try:
                     if await page.is_visible("#resultCard"):
                         content = await page.locator("#resultCard").inner_text()
@@ -294,7 +414,6 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                             break
                 except: pass
 
-                # Check unlock label
                 try:
                     unlocked = await page.evaluate(
                         "() => { const el = document.querySelector('#waitTimerLabel'); "
@@ -304,10 +423,8 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                 except Exception as e:
                     logger.warning(f"Check failed: {e}")
 
-                # Handle the ad gate (if visible)
                 await handle_ad_gate(page, step)
 
-                # Click the "Continue (an ad will open)" button
                 try:
                     await page.wait_for_selector("#btnNext:not([disabled])", timeout=15000)
                     await page.click("#btnNext")
@@ -317,7 +434,7 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
                     logger.warning(f"[Step {step}] Could not click #btnNext: {e}")
                     break
 
-            # --- Wait for the final result card ---
+            # --- Wait for final result ---
             if progress_message:
                 await update_progress(progress_message, 95, "⏳ Waiting for final result...")
             logger.info("Waiting for #resultCard (up to 60s)...")
@@ -360,7 +477,7 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
             logger.info(f"========== END UNLOCK (failed) for {account_id} ==========")
             return False, 0
 
-# --- 6. BACKGROUND TIMER LOOP ---
+# --- 7. BACKGROUND TIMER LOOP ---
 async def timer_loop(context):
     while True:
         try:
@@ -400,7 +517,7 @@ async def timer_loop(context):
             logger.error(f"Error in timer loop: {e}")
         await asyncio.sleep(60)
 
-# --- 7. TELEGRAM COMMANDS ---
+# --- 8. TELEGRAM COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user(user_id)
@@ -471,13 +588,11 @@ async def process_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application):
     init_db()
-    # Proxies disabled for now — none of the free ones work
-    # loop = asyncio.get_event_loop()
-    # loop.run_in_executor(None, fetch_and_validate_proxies)
+    # Proxies disabled — none of the free ones work
     asyncio.create_task(timer_loop(application))
-    logger.info("Bot initialized.")
+    logger.info("Bot initialized with stealth mode.")
 
-# --- 8. KEEP-ALIVE ---
+# --- 9. KEEP-ALIVE ---
 def keep_alive():
     space_host = os.getenv("SPACE_HOST")
     render_url = os.getenv("RENDER_EXTERNAL_URL")
@@ -498,7 +613,7 @@ def keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
 
-# --- 9. HEALTH CHECK SERVER ---
+# --- 10. HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -517,7 +632,7 @@ def run_health_server():
     except Exception as e:
         logger.warning(f"Health server failed to start: {e}")
 
-# --- 10. MAIN ENTRY POINT ---
+# --- 11. MAIN ENTRY POINT ---
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
@@ -526,7 +641,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id))
 
-    print("🤖 Bot running with Multi-Step Ad Loop + Progress Bar...")
+    print("🤖 Bot running with Stealth Mode + Multi-Step Ad Loop + Progress Bar...")
     app.run_polling()
 
 if __name__ == "__main__":
