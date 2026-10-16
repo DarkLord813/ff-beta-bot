@@ -121,7 +121,85 @@ async def update_progress(message, percent, step_text):
     except Exception as e:
         logger.warning(f"Failed to edit progress: {e}")
 
-# --- 4. AD HANDLING & BROWSER AUTOMATION ---
+# --- 4. DEBUG HELPERS ---
+async def dump_page_state(page, tag):
+    """Logs the current state of key elements on the page."""
+    logger.info(f"--- PAGE STATE [{tag}] ---")
+    try:
+        logger.info(f"URL: {page.url}")
+    except:
+        pass
+
+    # Check step circles
+    for i in range(1, 5):
+        try:
+            cls = await page.get_attribute(f"#stepCircle{i}", "class")
+            logger.info(f"stepCircle{i}: {cls}")
+        except:
+            pass
+
+    # Check step header
+    try:
+        hdr = await page.locator("#hdr").inner_text()
+        logger.info(f"hdr: '{hdr}'")
+    except:
+        pass
+
+    # Check wait timer label
+    try:
+        label = await page.locator("#waitTimerLabel").inner_text()
+        logger.info(f"waitTimerLabel: '{label}'")
+    except:
+        pass
+
+    # Check if ad gate is visible
+    try:
+        gate_visible = await page.is_visible("#adGate:not(.hidden)")
+        logger.info(f"adGate visible: {gate_visible}")
+        if gate_visible:
+            try:
+                gate_title = await page.locator("#adGateTitle").inner_text()
+                logger.info(f"adGateTitle: '{gate_title}'")
+            except:
+                pass
+            try:
+                gate_btn = await page.locator("#adGateOpen").inner_text()
+                logger.info(f"adGateOpen text: '{gate_btn}'")
+            except:
+                pass
+            try:
+                gate_cont_disabled = await page.get_attribute("#adGateContinue", "disabled")
+                logger.info(f"adGateContinue disabled: {gate_cont_disabled}")
+            except:
+                pass
+    except:
+        pass
+
+    # Check btnNext
+    try:
+        btn_next_visible = await page.is_visible("#btnNext")
+        btn_next_disabled = await page.get_attribute("#btnNext", "disabled")
+        logger.info(f"btnNext visible={btn_next_visible} disabled={btn_next_disabled}")
+    except:
+        pass
+
+    # Check btnStart
+    try:
+        btn_start_disabled = await page.get_attribute("#btnStart", "disabled")
+        logger.info(f"btnStart disabled: {btn_start_disabled}")
+    except:
+        pass
+
+    # Check resultCard
+    try:
+        if await page.is_visible("#resultCard"):
+            logger.info("resultCard is visible")
+    except:
+        pass
+
+    logger.info(f"--- END PAGE STATE [{tag}] ---")
+
+# --- 5. AD HANDLING & BROWSER AUTOMATION ---
 async def close_new_page(page):
     try:
         await page.wait_for_timeout(1500)
@@ -130,10 +208,11 @@ async def close_new_page(page):
         pass
 
 async def handle_ad_gate(page, step_num):
-    """Handles one ad gate cycle. Returns True if handled, False if no gate appeared."""
+    """Handles one ad gate cycle."""
+    logger.info(f"[Step {step_num}] Checking for ad gate...")
     try:
         await page.wait_for_selector("#adGate:not(.hidden)", timeout=6000)
-        logger.info(f"[Step {step_num}] Ad gate detected.")
+        logger.info(f"[Step {step_num}] ✅ Ad gate detected.")
     except:
         logger.info(f"[Step {step_num}] No ad gate appeared — skipping.")
         return False
@@ -141,18 +220,21 @@ async def handle_ad_gate(page, step_num):
     # Click "Open Ad"
     try:
         if await page.is_visible("#adGateOpen"):
+            btn_text = await page.locator("#adGateOpen").inner_text()
+            logger.info(f"[Step {step_num}] Clicking '#adGateOpen' (text: '{btn_text}')")
             await page.click("#adGateOpen")
-            logger.info(f"[Step {step_num}] Clicked 'Open Ad'.")
             await page.wait_for_timeout(3000)
+            logger.info(f"[Step {step_num}] Clicked. Waiting for continue button...")
     except Exception as e:
         logger.warning(f"[Step {step_num}] adGateOpen click failed: {e}")
 
-    # Wait for the "Continue" button to become enabled
+    # Wait for the Continue button to become enabled
     try:
         await page.wait_for_selector("#adGateContinue:not([disabled])", timeout=45000)
+        logger.info(f"[Step {step_num}] adGateContinue enabled. Clicking...")
         await page.click("#adGateContinue")
-        logger.info(f"[Step {step_num}] Clicked ad gate 'Continue'.")
         await page.wait_for_timeout(2000)
+        logger.info(f"[Step {step_num}] ✅ Ad gate handled.")
     except Exception as e:
         logger.warning(f"[Step {step_num}] adGateContinue failed: {e}")
 
@@ -160,12 +242,14 @@ async def handle_ad_gate(page, step_num):
 
 async def click_step_continue(page, step_num):
     """Clicks the main #btnNext button for the current step."""
+    logger.info(f"[Step {step_num}] Looking for #btnNext...")
     try:
-        # Wait for btnNext to be enabled and visible
         await page.wait_for_selector("#btnNext:not([disabled])", timeout=10000)
+        btn_text = await page.locator("#btnNext").inner_text()
+        logger.info(f"[Step {step_num}] Clicking #btnNext (text: '{btn_text}')")
         await page.click("#btnNext")
-        logger.info(f"[Step {step_num}] Clicked #btnNext.")
         await page.wait_for_timeout(2500)
+        logger.info(f"[Step {step_num}] ✅ Clicked #btnNext.")
         return True
     except Exception as e:
         logger.warning(f"[Step {step_num}] #btnNext click failed: {e}")
@@ -190,39 +274,33 @@ def parse_timer_from_text(text):
     return None
 
 async def run_unlock_process(user_id, account_id, context, progress_message=None):
+    logger.info(f"========== START UNLOCK for {account_id} ==========")
+
     async with async_playwright() as p:
         proxy_url = get_random_proxy()
         launch_options = {
             "headless": True,
             "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--single-process",
-                "--disable-setuid-sandbox",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-breakpad",
-                "--disable-component-extensions-with-background-pages",
-                "--disable-default-apps",
-                "--disable-features=TranslateUI",
-                "--disable-ipc-flooding-protection",
-                "--disable-renderer-backgrounding",
-                "--memory-pressure-off",
+                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                "--disable-extensions", "--single-process", "--disable-setuid-sandbox",
+                "--disable-accelerated-2d-canvas", "--no-first-run", "--no-zygote",
+                "--disable-background-networking", "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows", "--disable-breakpad",
+                "--disable-component-extensions-with-background-pages", "--disable-default-apps",
+                "--disable-features=TranslateUI", "--disable-ipc-flooding-protection",
+                "--disable-renderer-backgrounding", "--memory-pressure-off",
                 "--max_old_space_size=256",
             ]
         }
         if proxy_url:
             launch_options["proxy"] = {"server": f"http://{proxy_url}"}
             logger.info(f"Using proxy: {proxy_url}")
+        else:
+            logger.info("No proxy — using direct connection.")
 
         try:
             browser = await p.chromium.launch(**launch_options)
+            logger.info("Browser launched.")
         except Exception as e:
             logger.error(f"Browser launch failed: {e}")
             if progress_message:
@@ -237,77 +315,95 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
         context_browser.on("page", lambda np: asyncio.create_task(close_new_page(np)))
 
         try:
-            # --- Initial page load ---
+            # --- Load ---
             if progress_message:
                 await update_progress(progress_message, 10, "🌐 Opening website...")
+            logger.info("Navigating to site...")
             await page.goto(TARGET_URL, wait_until="domcontentloaded")
             await page.wait_for_timeout(2500)
+            logger.info("Site loaded.")
+            await dump_page_state(page, "after_load")
 
             # --- Enter ID ---
             if progress_message:
                 await update_progress(progress_message, 20, "🖱️ Clicking 'Continue without Discord'...")
+            logger.info("Waiting for #btnGuest...")
             await page.wait_for_selector("#btnGuest", timeout=15000)
             await page.click("#btnGuest")
+            logger.info("Clicked #btnGuest.")
             await page.wait_for_timeout(1500)
+            await dump_page_state(page, "after_btnGuest")
 
             if progress_message:
                 await update_progress(progress_message, 30, f"⌨️ Entering ID: {account_id}")
+            logger.info("Waiting for #acctInput...")
             await page.wait_for_selector("#acctInput", timeout=15000)
             await page.fill("#acctInput", account_id)
+            logger.info(f"Filled #acctInput with {account_id}.")
 
             if progress_message:
                 await update_progress(progress_message, 40, "📤 Submitting ID...")
+            logger.info("Waiting for #btnStart to enable...")
             await page.wait_for_selector("#btnStart:not([disabled])", timeout=15000)
             await page.click("#btnStart")
-            await page.wait_for_timeout(2000)
+            logger.info("Clicked #btnStart.")
+            await page.wait_for_timeout(2500)
+            await dump_page_state(page, "after_btnStart")
 
-            # --- Multi-step loop (handles up to 5 steps) ---
-            max_steps = 5
+            # --- Multi-step loop ---
+            max_steps = 6
             for step in range(1, max_steps + 1):
-                percent = 40 + (step * 10)
-                if percent > 90:
-                    percent = 90
+                logger.info(f">>>>>>>> LOOP ITERATION {step} <<<<<<<<")
+                percent = min(40 + (step * 8), 90)
                 if progress_message:
                     await update_progress(
                         progress_message, percent,
                         f"🎬 Ad step {step}/{max_steps}..."
                     )
 
-                # Check if we're already unlocked (final screen)
+                await dump_page_state(page, f"step_{step}_start")
+
+                # Check if already unlocked
                 try:
                     unlocked = await page.evaluate(
                         "() => { const el = document.querySelector('#waitTimerLabel'); "
                         "return el && el.innerText.includes('Unlocked'); }"
                     )
                     if unlocked:
-                        logger.info(f"[Step {step}] Already unlocked! Breaking loop.")
+                        logger.info(f"[Step {step}] ✅ Already unlocked! Breaking loop.")
                         break
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Unlock check failed: {e}")
 
-                # Handle the ad gate for this step
+                # Handle ad gate
                 await handle_ad_gate(page, step)
 
-                # Click the main "Continue (an ad will open)" button
+                # Click step continue
                 clicked = await click_step_continue(page, step)
                 if not clicked:
-                    logger.info(f"[Step {step}] No more Continue buttons. Assuming done.")
+                    logger.info(f"[Step {step}] Could not click #btnNext. Assuming done.")
                     break
 
-                # Wait a moment for next step to load
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(2500)
 
-            # --- Wait for the unlock timer to appear ---
+            # --- Wait for unlock ---
+            await dump_page_state(page, "before_final_wait")
             if progress_message:
                 await update_progress(progress_message, 95, "⏳ Waiting for unlock timer...")
-            await page.wait_for_function(
-                "document.querySelector('#waitTimerLabel') && "
-                "document.querySelector('#waitTimerLabel').innerText.includes('Unlocked')",
-                timeout=60000
-            )
-            logger.info("Unlock confirmed.")
+            logger.info("Waiting for 'Unlocked' text (up to 60s)...")
+            try:
+                await page.wait_for_function(
+                    "document.querySelector('#waitTimerLabel') && "
+                    "document.querySelector('#waitTimerLabel').innerText.includes('Unlocked')",
+                    timeout=60000
+                )
+                logger.info("✅ Unlock confirmed.")
+            except Exception as e:
+                logger.error(f"Final unlock wait failed: {e}")
+                await dump_page_state(page, "unlock_timeout")
+                raise
 
-            # --- Read the timer ---
+            # --- Read timer ---
             detected_timer = None
             try:
                 await page.wait_for_timeout(2000)
@@ -323,16 +419,24 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
 
             if progress_message:
                 await update_progress(progress_message, 100, "✅ Unlock complete!")
+            logger.info(f"========== END UNLOCK (success) for {account_id} ==========")
             return True, final_timer
 
         except Exception as e:
-            logger.error(f"Automation error: {e}")
+            logger.error(f"❌ Automation error: {e}")
+            await dump_page_state(page, "error_state")
+            try:
+                await page.screenshot(path="/tmp/error_screenshot.png")
+                logger.info("Saved error screenshot to /tmp/error_screenshot.png")
+            except:
+                pass
             await browser.close()
             if progress_message:
                 await update_progress(progress_message, 100, f"❌ Error: {str(e)[:50]}")
+            logger.info(f"========== END UNLOCK (failed) for {account_id} ==========")
             return False, 0
 
-# --- 5. BACKGROUND TIMER LOOP ---
+# --- 6. BACKGROUND TIMER LOOP ---
 async def timer_loop(context):
     while True:
         try:
@@ -372,7 +476,7 @@ async def timer_loop(context):
             logger.error(f"Error in timer loop: {e}")
         await asyncio.sleep(60)
 
-# --- 6. TELEGRAM COMMANDS ---
+# --- 7. TELEGRAM COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user(user_id)
@@ -403,6 +507,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_id_input = update.message.text.strip()
+    logger.info(f"Received ID from user {user_id}: {user_id_input}")
 
     if not user_id_input.isdigit() or len(user_id_input) > 11:
         await update.message.reply_text("❌ Please send a valid numeric ID (max 11 digits).")
@@ -442,11 +547,13 @@ async def process_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application):
     init_db()
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, fetch_and_validate_proxies)
+    # Proxies disabled for now (they were all dead)
+    # loop = asyncio.get_event_loop()
+    # loop.run_in_executor(None, fetch_and_validate_proxies)
     asyncio.create_task(timer_loop(application))
+    logger.info("Bot initialized.")
 
-# --- 7. KEEP-ALIVE ---
+# --- 8. KEEP-ALIVE ---
 def keep_alive():
     space_host = os.getenv("SPACE_HOST")
     render_url = os.getenv("RENDER_EXTERNAL_URL")
@@ -467,7 +574,7 @@ def keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
 
-# --- 8. HEALTH CHECK SERVER ---
+# --- 9. HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -486,7 +593,7 @@ def run_health_server():
     except Exception as e:
         logger.warning(f"Health server failed to start: {e}")
 
-# --- 9. MAIN ENTRY POINT ---
+# --- 10. MAIN ENTRY POINT ---
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
@@ -495,7 +602,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id))
 
-    print("🤖 Bot running with Multi-Step Ad Handling + Progress Bar...")
+    print("🤖 Bot running with DETAILED LOGGING + Multi-Step Ad Handling...")
     app.run_polling()
 
 if __name__ == "__main__":
