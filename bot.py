@@ -9,20 +9,16 @@ import time
 import requests
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from playwright.async_api import async_playwright
 
-# Try to import playwright-stealth (optional, may vary by version)
+# Try to import playwright-stealth
 try:
     from playwright_stealth import stealth_async
     STEALTH_AVAILABLE = True
 except ImportError:
-    try:
-        from playwright_stealth import Stealth
-        STEALTH_AVAILABLE = True
-    except ImportError:
-        STEALTH_AVAILABLE = False
+    STEALTH_AVAILABLE = False
 
 # --- 1. CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
@@ -33,51 +29,14 @@ TARGET_URL = "https://unlockffbeta.com"
 DB_NAME = "/data/users.db" if os.path.exists("/data") else "users.db"
 DEFAULT_TIMER_SECONDS = 24 * 60 * 60
 
-# =====================================================================
-# 🌐 FREE PROXY FETCHER
-# =====================================================================
-PROXY_SOURCES = [
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt",
+# ⚠️ SET YOUR CHANNELS HERE ⚠️
+CHANNELS = [
+    {"name": "NCK Dev", "url": "https://t.me/NCK_Dev", "id": "@NCK_Dev"},
+    {"name": "NCK Free", "url": "https://t.me/NCKDEVFreeSC", "id": "@NCKDEVFreeSC"},
+    {"name": "Error 404", "url": "https://t.me/ERRORX404E", "id": "@ERRORX404E"}
 ]
 
-VALID_PROXIES = []
-
-def fetch_and_validate_proxies():
-    global VALID_PROXIES
-    VALID_PROXIES = []
-    raw_proxies = []
-    for url in PROXY_SOURCES:
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                for line in r.text.strip().split("\n"):
-                    if line and not line.startswith("#"):
-                        raw_proxies.append(line.strip())
-        except Exception as e:
-            logging.warning(f"Failed to fetch proxy source: {e}")
-
-    logging.info(f"Downloaded {len(raw_proxies)} raw proxies. Validating...")
-    for proxy in raw_proxies[:50]:
-        try:
-            resp = requests.get(
-                "https://httpbin.org/ip",
-                proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
-                timeout=8
-            )
-            if resp.status_code == 200:
-                VALID_PROXIES.append(proxy)
-        except:
-            pass
-    logging.info(f"Validated {len(VALID_PROXIES)} working proxies.")
-
-def get_random_proxy():
-    return random.choice(VALID_PROXIES) if VALID_PROXIES else None
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- 2. DATABASE FUNCTIONS ---
@@ -86,90 +45,115 @@ def init_db():
         os.makedirs(os.path.dirname(DB_NAME), exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, account_id TEXT, next_run TIMESTAMP)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        account_id TEXT,
+        next_run TIMESTAMP,
+        UNIQUE(user_id, account_id) ON CONFLICT IGNORE)''')
     conn.commit()
     conn.close()
 
-def save_user(user_id, account_id, next_run_time):
+def add_account(user_id, account_id, next_run_time):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO users (user_id, account_id, next_run)
-        VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
-        account_id=excluded.account_id, next_run=excluded.next_run''',
-        (user_id, account_id, next_run_time))
+    cursor.execute('SELECT id FROM accounts WHERE user_id = ? AND account_id = ?', (user_id, account_id))
+    if cursor.fetchone():
+        conn.close()
+        return False
+    cursor.execute('INSERT INTO accounts (user_id, account_id, next_run) VALUES (?, ?, ?)', 
+                   (user_id, account_id, next_run_time))
     conn.commit()
     conn.close()
+    return True
 
-def get_user(user_id):
+def get_user_accounts(user_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('SELECT account_id, next_run FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    cursor.execute('SELECT id, account_id, next_run FROM accounts WHERE user_id = ?', (user_id,))
+    rows = cursor.fetchall()
     conn.close()
-    return row
+    return rows
+
+def remove_account(user_id, account_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM accounts WHERE user_id = ? AND account_id = ?', (user_id, account_id))
+    conn.commit()
+    conn.close()
 
 def get_expired_users():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     now_str = datetime.now().isoformat()
-    cursor.execute('SELECT user_id, account_id FROM users WHERE next_run <= ?', (now_str,))
+    cursor.execute('SELECT id, user_id, account_id FROM accounts WHERE next_run <= ?', (now_str,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
-# --- 3. PROGRESS BAR HELPER ---
+def update_account_timer(acc_id, next_run_time):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE accounts SET next_run = ? WHERE id = ?', (next_run_time, acc_id))
+    conn.commit()
+    conn.close()
+
+# --- 3. HELPERS ---
 def make_progress_bar(percent, length=20):
     filled = int(length * percent // 100)
-    bar = "█" * filled + "░" * (length - filled)
-    return f"[{bar}] {percent}%"
+    return f"[{'█' * filled}{'░' * (length - filled)}] {percent}%"
 
 async def update_progress(message, percent, step_text):
-    bar = make_progress_bar(percent)
-    text = f"⏳ *Processing Account*\n\n`{bar}`\n\n🔹 {step_text}"
     try:
-        await message.edit_text(text, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning(f"Failed to edit progress: {e}")
-
-# --- 4. DEBUG HELPERS ---
-async def dump_page_state(page, tag):
-    logger.info(f"--- PAGE STATE [{tag}] ---")
-    try:
-        logger.info(f"URL: {page.url}")
+        await message.edit_text(f"⏳ *Processing...*\n\n`{make_progress_bar(percent)}`\n\n🔹 {step_text}", parse_mode="Markdown")
     except: pass
-    for i in range(1, 5):
+
+def parse_timer_from_text(text):
+    if not text: return None
+    total = 0
+    h = re.search(r'(\d+)\s*h', text, re.IGNORECASE)
+    m = re.search(r'(\d+)\s*m', text, re.IGNORECASE)
+    s = re.search(r'(\d+)\s*s', text, re.IGNORECASE)
+    if h: total += int(h.group(1)) * 3600
+    if m: total += int(m.group(1)) * 60
+    if s: total += int(s.group(1))
+    if total > 0: return total
+    tm = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
+    if tm:
+        hh, mm, ss = map(int, tm.groups())
+        return hh * 3600 + mm * 60 + ss
+    return None
+
+def format_time_left(seconds):
+    """Converts seconds into a readable string like '1h 15m' or '45m 30s'."""
+    if seconds <= 0:
+        return "⏳ Unlocking now..."
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
+
+# --- 4. FORCE JOIN CHECKER ---
+async def check_joined(user_id, context):
+    missing = []
+    for ch in CHANNELS:
         try:
-            cls = await page.get_attribute(f"#stepCircle{i}", "class")
-            logger.info(f"stepCircle{i}: {cls}")
-        except: pass
-    try:
-        hdr = await page.locator("#hdr").inner_text()
-        logger.info(f"hdr: '{hdr}'")
-    except: pass
-    try:
-        label = await page.locator("#waitTimerLabel").inner_text()
-        logger.info(f"waitTimerLabel: '{label}'")
-    except: pass
-    try:
-        result_visible = await page.is_visible("#resultCard")
-        result_text = ""
-        if result_visible:
-            result_text = await page.locator("#resultCard").inner_text()
-        logger.info(f"resultCard visible: {result_visible}, text: '{result_text[:100]}'")
-    except: pass
-    try:
-        gate_visible = await page.is_visible("#adGate:not(.hidden)")
-        logger.info(f"adGate visible: {gate_visible}")
-    except: pass
-    try:
-        btn_next_visible = await page.is_visible("#btnNext")
-        btn_next_disabled = await page.get_attribute("#btnNext", "disabled")
-        logger.info(f"btnNext visible={btn_next_visible} disabled={btn_next_disabled}")
-    except: pass
-    logger.info(f"--- END PAGE STATE [{tag}] ---")
+            member = await context.bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
+            if member.status in ['left', 'kicked']:
+                missing.append(ch)
+        except Exception:
+            # If bot is not admin, we can't check. We assume they joined to prevent blocking.
+            pass 
+    return missing
 
-# --- 5. AD HANDLING & BROWSER AUTOMATION ---
+# --- 5. BROWSER AUTOMATION ---
 async def close_new_page(page):
     try:
         await page.wait_for_timeout(1500)
@@ -178,421 +162,293 @@ async def close_new_page(page):
 
 async def handle_ad_gate(page, step_num):
     try:
-        await page.wait_for_selector("#adGate:not(.hidden)", timeout=6000)
-        logger.info(f"[Step {step_num}] Ad gate detected.")
+        await page.wait_for_selector("#adGate:not(.hidden)", timeout=5000)
     except:
-        logger.info(f"[Step {step_num}] No ad gate appeared.")
         return False
     try:
         if await page.is_visible("#adGateOpen"):
-            btn_text = await page.locator("#adGateOpen").inner_text()
-            logger.info(f"[Step {step_num}] Clicking adGateOpen (text: '{btn_text}')")
             await page.click("#adGateOpen")
-            await page.wait_for_timeout(3000)
-    except Exception as e:
-        logger.warning(f"[Step {step_num}] adGateOpen click failed: {e}")
+            await page.wait_for_timeout(2500)
+    except: pass
     try:
-        await page.wait_for_selector("#adGateContinue:not([disabled])", timeout=45000)
-        logger.info(f"[Step {step_num}] adGateContinue enabled. Clicking...")
+        await page.wait_for_selector("#adGateContinue:not([disabled])", timeout=40000)
         await page.click("#adGateContinue")
-        await page.wait_for_timeout(2000)
-    except Exception as e:
-        logger.warning(f"[Step {step_num}] adGateContinue failed: {e}")
+        await page.wait_for_timeout(1500)
+    except: pass
     return True
-
-def parse_timer_from_text(text):
-    if not text:
-        return None
-    total = 0
-    h = re.search(r'(\d+)\s*h', text, re.IGNORECASE)
-    m = re.search(r'(\d+)\s*m', text, re.IGNORECASE)
-    s = re.search(r'(\d+)\s*s', text, re.IGNORECASE)
-    if h: total += int(h.group(1)) * 3600
-    if m: total += int(m.group(1)) * 60
-    if s: total += int(s.group(1))
-    if total > 0:
-        return total
-    tm = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
-    if tm:
-        hh, mm, ss = map(int, tm.groups())
-        return hh * 3600 + mm * 60 + ss
-    return None
 
 async def run_unlock_process(user_id, account_id, context, progress_message=None):
     logger.info(f"========== START UNLOCK for {account_id} ==========")
-
+    
     async with async_playwright() as p:
-        proxy_url = get_random_proxy()
         launch_options = {
-            "headless": False,  # We control headless via arg
-            "channel": "chromium",  # Use full Chromium, not headless shell
+            "headless": False,
+            "channel": "chromium",
             "args": [
-                "--headless=new",  # New headless mode (mimics real browser)
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-setuid-sandbox",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-breakpad",
-                "--disable-component-extensions-with-background-pages",
-                "--disable-default-apps",
-                "--disable-features=TranslateUI",
-                "--disable-ipc-flooding-protection",
-                "--disable-renderer-backgrounding",
-                "--memory-pressure-off",
-                "--max_old_space_size=256",
-                "--window-size=360,640",
+                "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                "--disable-extensions", "--single-process", "--disable-setuid-sandbox",
+                "--no-zygote", "--window-size=360,640", "--disable-blink-features=AutomationControlled"
             ]
         }
-        if proxy_url:
-            launch_options["proxy"] = {"server": f"http://{proxy_url}"}
-            logger.info(f"Using proxy: {proxy_url}")
-        else:
-            logger.info("No proxy — using direct connection.")
-
+        
         try:
             browser = await p.chromium.launch(**launch_options)
-            logger.info("Browser launched (full Chromium, new headless mode).")
         except Exception as e:
             logger.error(f"Browser launch failed: {e}")
-            if progress_message:
-                await update_progress(progress_message, 100, "❌ Browser failed to launch")
             return False, 0
 
-        context_browser = await browser.new_context(
+        ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
             viewport={'width': 360, 'height': 640},
             locale="en-US",
-            timezone_id="Africa/Lagos",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Sec-Ch-Ua": '"Chromium";v="120", "Not_A Brand";v="8"',
-                "Sec-Ch-Ua-Mobile": "?1",
-                "Sec-Ch-Ua-Platform": '"Android"',
-            }
+            timezone_id="Africa/Lagos"
         )
-        page = await context_browser.new_page()
-        context_browser.on("page", lambda np: asyncio.create_task(close_new_page(np)))
+        page = await ctx.new_page()
+        ctx.on("page", lambda np: asyncio.create_task(close_new_page(np)))
 
-        # Apply stealth patches if available
         if STEALTH_AVAILABLE:
-            try:
-                await stealth_async(page)
-                logger.info("Stealth patches applied.")
-            except Exception as e:
-                logger.warning(f"Stealth patch failed: {e}")
-        else:
-            logger.warning("playwright-stealth not available. Skipping.")
+            await stealth_async(page)
 
         try:
-            # --- Load ---
-            if progress_message:
-                await update_progress(progress_message, 10, "🌐 Opening website...")
-            logger.info("Navigating to site...")
+            if progress_message: await update_progress(progress_message, 10, "🌐 Opening website...")
             await page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
-            await page.wait_for_timeout(5000)
-            logger.info("Site loaded.")
-            await dump_page_state(page, "after_load")
+            await page.wait_for_timeout(4000)
 
-            # --- Screenshot for debugging ---
-            try:
-                await page.screenshot(path="/tmp/page_after_load.png", full_page=True)
-                logger.info("Saved /tmp/page_after_load.png")
-            except: pass
+            if progress_message: await update_progress(progress_message, 20, "🖱️ Clicking Continue...")
+            await page.wait_for_selector("#btnGuest", timeout=30000, state="visible")
+            await page.click("#btnGuest")
+            await page.wait_for_timeout(2000)
 
-            # --- Log body text to detect bot blocking ---
-            try:
-                body_text = await page.locator("body").inner_text()
-                logger.info(f"BODY TEXT (first 500 chars): {body_text[:500]}")
-            except Exception as e:
-                logger.warning(f"Could not read body: {e}")
-
-            # --- Wait for #btnGuest ---
-            if progress_message:
-                await update_progress(progress_message, 20, "🖱️ Looking for Continue button...")
-            logger.info("Waiting for #btnGuest (up to 60s)...")
-            try:
-                await page.wait_for_selector("#btnGuest", timeout=60000, state="visible")
-                logger.info("Found #btnGuest. Clicking...")
-                await page.click("#btnGuest")
-                await page.wait_for_timeout(2500)
-            except Exception as e:
-                logger.error(f"#btnGuest not found: {e}")
-                await dump_page_state(page, "btnGuest_missing")
-                try:
-                    await page.screenshot(path="/tmp/btnGuest_missing.png", full_page=True)
-                except: pass
-                raise Exception(f"#btnGuest not found")
-
-            # --- Enter ID ---
-            if progress_message:
-                await update_progress(progress_message, 30, f"⌨️ Entering ID: {account_id}")
-            logger.info("Waiting for #acctInput...")
+            if progress_message: await update_progress(progress_message, 30, f"⌨️ Entering ID: {account_id}")
             await page.wait_for_selector("#acctInput", timeout=20000)
             await page.fill("#acctInput", account_id)
-            logger.info(f"Filled #acctInput with {account_id}.")
 
-            if progress_message:
-                await update_progress(progress_message, 40, "📤 Submitting ID...")
-            logger.info("Waiting for #btnStart to enable...")
+            if progress_message: await update_progress(progress_message, 40, "📤 Submitting...")
             await page.wait_for_selector("#btnStart:not([disabled])", timeout=20000)
             await page.click("#btnStart")
-            logger.info("Clicked #btnStart.")
-            await page.wait_for_timeout(4000)
-            await dump_page_state(page, "after_btnStart")
+            await page.wait_for_timeout(3000)
 
-            # --- Multi-step loop: click #btnNext until #resultCard appears ---
-            max_steps = 6
-            for step in range(1, max_steps + 1):
-                logger.info(f">>>>>>>> STEP {step} <<<<<<<<")
-                percent = min(40 + (step * 10), 90)
-                if progress_message:
-                    await update_progress(progress_message, percent, f"🎬 Ad step {step}/{max_steps}...")
-
-                try:
-                    if await page.is_visible("#resultCard"):
-                        content = await page.locator("#resultCard").inner_text()
-                        if content.strip():
-                            logger.info(f"[Step {step}] ✅ Result card populated! Unlock complete.")
-                            break
-                except: pass
-
-                try:
-                    unlocked = await page.evaluate(
-                        "() => { const el = document.querySelector('#waitTimerLabel'); "
-                        "return el && el.innerText.includes('Unlocked'); }"
-                    )
-                    logger.info(f"[Step {step}] Unlock label shows: {unlocked}")
-                except Exception as e:
-                    logger.warning(f"Check failed: {e}")
+            # Multi-step loop
+            for step in range(1, 7):
+                if progress_message: await update_progress(progress_message, min(40 + (step * 10), 90), f"🎬 Ad step {step}...")
+                
+                if await page.is_visible("#resultCard"):
+                    content = await page.locator("#resultCard").inner_text()
+                    if content.strip(): break
 
                 await handle_ad_gate(page, step)
 
                 try:
-                    await page.wait_for_selector("#btnNext:not([disabled])", timeout=15000)
+                    await page.wait_for_selector("#btnNext:not([disabled])", timeout=10000)
                     await page.click("#btnNext")
-                    logger.info(f"[Step {step}] Clicked #btnNext.")
-                    await page.wait_for_timeout(4000)
-                except Exception as e:
-                    logger.warning(f"[Step {step}] Could not click #btnNext: {e}")
-                    break
+                    await page.wait_for_timeout(3500)
+                except: break
 
-            # --- Wait for the final result card ---
-            if progress_message:
-                await update_progress(progress_message, 95, "⏳ Waiting for final result...")
-            logger.info("Waiting for #resultCard (up to 60s)...")
-            try:
-                await page.wait_for_selector("#resultCard:not(:empty)", timeout=60000)
-                logger.info("✅ Result card found.")
-            except Exception as e:
-                logger.error(f"Final result wait failed: {e}")
-                await dump_page_state(page, "result_timeout")
-                try:
-                    await page.screenshot(path="/tmp/result_timeout.png", full_page=True)
-                except: pass
-                raise
+            if progress_message: await update_progress(progress_message, 95, "⏳ Waiting for final result...")
+            await page.wait_for_selector("#resultCard:not(:empty)", timeout=60000)
 
-            # --- Read the timer ---
             detected_timer = None
-            try:
-                await page.wait_for_timeout(2000)
-                if await page.is_visible("#expireCountdown"):
-                    timer_text = await page.locator("#expireCountdown").inner_text()
-                    detected_timer = parse_timer_from_text(timer_text)
-                    logger.info(f"Detected timer: '{timer_text}' -> {detected_timer}s")
-            except Exception as e:
-                logger.warning(f"Could not read timer: {e}")
+            if await page.is_visible("#expireCountdown"):
+                timer_text = await page.locator("#expireCountdown").inner_text()
+                detected_timer = parse_timer_from_text(timer_text)
 
             await browser.close()
-            final_timer = detected_timer if detected_timer else DEFAULT_TIMER_SECONDS
-
-            if progress_message:
-                await update_progress(progress_message, 100, "✅ Unlock complete!")
-            logger.info(f"========== END UNLOCK (success) for {account_id} ==========")
-            return True, final_timer
+            return True, detected_timer if detected_timer else DEFAULT_TIMER_SECONDS
 
         except Exception as e:
             logger.error(f"❌ Automation error: {e}")
-            await dump_page_state(page, "error_state")
-            try:
-                await page.screenshot(path="/tmp/error_screenshot.png", full_page=True)
-            except: pass
             await browser.close()
-            if progress_message:
-                await update_progress(progress_message, 100, f"❌ Error: {str(e)[:50]}")
-            logger.info(f"========== END UNLOCK (failed) for {account_id} ==========")
             return False, 0
 
 # --- 6. BACKGROUND TIMER LOOP ---
 async def timer_loop(context):
     while True:
         try:
-            expired_users = get_expired_users()
-            for user_id, account_id in expired_users:
-                logger.info(f"Timer expired for {user_id}. Re-unlocking...")
-                progress_msg = await context.bot.send_message(
-                    chat_id=user_id,
-                    text="🔄 *Auto-unlock triggered...*",
-                    parse_mode="Markdown"
-                )
-                success, timer_seconds = await run_unlock_process(
-                    user_id, account_id, context, progress_msg
-                )
-                if success:
-                    next_run = datetime.now() + timedelta(seconds=timer_seconds)
-                    save_user(user_id, account_id, next_run.isoformat())
-                    minutes = timer_seconds // 60
-                    seconds = timer_seconds % 60
-                    time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-                    await context.bot.send_message(
+            expired = get_expired_users()
+            for db_id, user_id, account_id in expired:
+                logger.info(f"Timer expired for {account_id}. Re-unlocking...")
+                
+                try:
+                    progress_msg = await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"✅ *Auto-unlock successful!*\n\n"
-                             f"📌 ID: `{account_id}`\n"
-                             f"⏱️ Website granted: {time_str}\n"
-                             f"🔄 Next auto-unlock scheduled.",
+                        text=f"🔄 *Auto-unlocking:* `{account_id}`...",
                         parse_mode="Markdown"
                     )
+                except: progress_msg = None
+
+                success, timer_seconds = await run_unlock_process(user_id, account_id, context, progress_msg)
+                
+                if success:
+                    next_run = datetime.now() + timedelta(seconds=timer_seconds)
+                    update_account_timer(db_id, next_run.isoformat())
+                    if progress_msg:
+                        await progress_msg.edit_text(f"✅ *Auto-Unlock Success!*\n\n📌 ID: `{account_id}`\n⏱️ Granted: {timer_seconds // 60}m", parse_mode="Markdown")
                 else:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"❌ Auto-unlock failed. Retrying in 5 minutes."
-                    )
                     next_run = datetime.now() + timedelta(minutes=5)
-                    save_user(user_id, account_id, next_run.isoformat())
+                    update_account_timer(db_id, next_run.isoformat())
+                    if progress_msg:
+                        await progress_msg.edit_text(f"❌ *Auto-Unlock Failed* for `{account_id}`. Retrying in 5m.", parse_mode="Markdown")
+
         except Exception as e:
             logger.error(f"Error in timer loop: {e}")
         await asyncio.sleep(60)
 
-# --- 7. TELEGRAM COMMANDS ---
+# --- 7. TELEGRAM UI ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user(user_id)
-    if user_data:
-        account_id, next_run_str = user_data
-        next_run = datetime.fromisoformat(next_run_str)
-        time_left = next_run - datetime.now()
-        if time_left.total_seconds() > 0:
-            minutes = int(time_left.total_seconds() // 60)
-            seconds = int(time_left.total_seconds() % 60)
-            await update.message.reply_text(
-                f"👋 *Welcome back!*\n\n"
-                f"📌 Saved ID: `{account_id}`\n"
-                f"⏱️ Next auto-unlock in: {minutes}m {seconds}s\n\n"
-                f"To change your ID, simply send a new one.",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"👋 ID `{account_id}` is due. Please wait.",
-                parse_mode="Markdown"
-            )
-    else:
+    
+    # Check Force Join
+    missing = await check_joined(user_id, context)
+    if missing:
+        keyboard = [[InlineKeyboardButton(f"Join {ch['name']}", url=ch["url"])] for ch in missing]
+        keyboard.append([InlineKeyboardButton("✅ I have joined", callback_data="check_join")])
         await update.message.reply_text(
-            "👋 Welcome! Please send me the Account ID you want to verify."
+            "⚠️ *You must join our channels to use this bot!*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
-
-async def process_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_id_input = update.message.text.strip()
-    logger.info(f"Received ID from user {user_id}: {user_id_input}")
-
-    if not user_id_input.isdigit() or len(user_id_input) > 11:
-        await update.message.reply_text("❌ Please send a valid numeric ID (max 11 digits).")
         return
 
-    progress_msg = await update.message.reply_text(
-        f"⏳ *Processing Account: {user_id_input}*\n\n`{make_progress_bar(0)}`\n\n🔹 Starting...",
-        parse_mode="Markdown"
-    )
+    await show_menu(update, context)
 
-    success, timer_seconds = await run_unlock_process(
-        user_id, user_id_input, context, progress_msg
-    )
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("➕ Add UID", callback_data="menu_add"), InlineKeyboardButton("📋 My UIDs", callback_data="menu_list")],
+        [InlineKeyboardButton("ℹ️ Bot Status", callback_data="menu_status")]
+    ]
+    text = "👋 *Welcome to the Auto-Unlock Bot!*\n\nSelect an option below:"
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "check_join":
+        missing = await check_joined(user_id, context)
+        if not missing:
+            await query.message.edit_text("✅ Thank you for joining!")
+            await show_menu(update, context)
+        else:
+            await query.message.reply_text("❌ You still haven't joined all channels.")
+
+    elif data == "menu_add":
+        await query.message.edit_text("✏️ *Send me the Account ID you want to add:*\n\n(Send it as a normal message)", parse_mode="Markdown")
+        context.user_data['awaiting_id'] = True
+
+    elif data == "menu_list":
+        accounts = get_user_accounts(user_id)
+        if not accounts:
+            await query.message.edit_text("You have no saved UIDs. Click 'Add UID' to start.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add UID", callback_data="menu_add")], [InlineKeyboardButton("🔙 Back", callback_data="menu_back")]]))
+            return
+        
+        text = "📋 *Your Saved UIDs & Unlock Time:*\n\n"
+        keyboard = []
+        now = datetime.now()
+        
+        for db_id, acc_id, next_run_str in accounts:
+            next_run = datetime.fromisoformat(next_run_str)
+            time_left_seconds = (next_run - now).total_seconds()
+            
+            # Format the remaining time
+            time_str = format_time_left(time_left_seconds)
+            
+            text += f"• `{acc_id}`\n   ⏱️ Time left: *{time_str}*\n\n"
+            keyboard.append([InlineKeyboardButton(f"❌ Remove {acc_id}", callback_data=f"rem_{acc_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu_list")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")])
+        
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except Exception:
+            # Ignore if message content is exactly the same (prevents Telegram errors)
+            pass
+
+    elif data.startswith("rem_"):
+        acc_id = data.split("_")[1]
+        remove_account(user_id, acc_id)
+        await query.message.edit_text(f"🗑️ Removed `{acc_id}`.\n\nReturning to menu...", parse_mode="Markdown")
+        await asyncio.sleep(1)
+        await show_menu(update, context)
+
+    elif data == "menu_status":
+        accounts = get_user_accounts(user_id)
+        await query.message.edit_text(
+            f"📊 *Bot Status*\n\n"
+            f"🟢 Bot is Online\n"
+            f"📁 Your Active UIDs: {len(accounts)}\n"
+            f"⏱️ Check interval: 1 minute",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_back")]]),
+            parse_mode="Markdown"
+        )
+
+    elif data == "menu_back":
+        await show_menu(update, context)
+
+async def process_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_id'):
+        return
+
+    user_id = update.effective_user.id
+    acc_id = update.message.text.strip()
+    context.user_data['awaiting_id'] = False
+
+    if not acc_id.isdigit() or len(acc_id) > 11:
+        await update.message.reply_text("❌ Invalid ID. Please send a numeric ID (max 11 digits). Send /start to try again.")
+        return
+
+    progress_msg = await update.message.reply_text(f"⏳ *Adding ID:* `{acc_id}`...", parse_mode="Markdown")
+    
+    success, timer_seconds = await run_unlock_process(user_id, acc_id, context, progress_msg)
 
     if success:
         next_run = datetime.now() + timedelta(seconds=timer_seconds)
-        save_user(user_id, user_id_input, next_run.isoformat())
-        minutes = timer_seconds // 60
-        seconds = timer_seconds % 60
-        time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-        await progress_msg.edit_text(
-            f"✅ *Account Unlocked!*\n\n"
-            f"`{make_progress_bar(100)}`\n\n"
-            f"📌 ID: `{user_id_input}`\n"
-            f"⏱️ Website granted: {time_str}\n"
-            f"🔄 Auto re-unlock when expires.\n\n"
-            f"Send /start to check status.",
-            parse_mode="Markdown"
-        )
+        added = add_account(user_id, acc_id, next_run.isoformat())
+        
+        if added:
+            time_str = format_time_left(timer_seconds)
+            await progress_msg.edit_text(f"✅ *ID Added & Unlocked!*\n\n📌 ID: `{acc_id}`\n⏱️ Granted: {time_str}\n\nUse the buttons below to manage.", parse_mode="Markdown")
+            await show_menu(update, context)
+        else:
+            await progress_msg.edit_text(f"⚠️ ID `{acc_id}` is already in your list.")
+            await show_menu(update, context)
     else:
-        await progress_msg.edit_text(
-            f"❌ *Unlock Failed*\n\n"
-            f"`{make_progress_bar(100)}`\n\n"
-            f"Please try again later.",
-            parse_mode="Markdown"
-        )
+        await progress_msg.edit_text("❌ Failed to unlock this ID. Please try later.")
 
-async def post_init(application):
-    init_db()
-    asyncio.create_task(timer_loop(application))
-    logger.info(f"Bot initialized. Stealth available: {STEALTH_AVAILABLE}")
-
-# --- 8. KEEP-ALIVE ---
+# --- 8. SERVER & MAIN ---
 def keep_alive():
-    space_host = os.getenv("SPACE_HOST")
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    url = None
-    if space_host:
-        url = f"https://{space_host}"
-    elif render_url:
-        url = render_url
-    if not url:
-        logger.info("⚠️ Not on Hugging Face or Render. Keep-alive disabled.")
-        return
-    logger.info(f"✅ Keep-alive started for: {url}")
+    url = os.getenv("RENDER_EXTERNAL_URL") or (f"https://{os.getenv('SPACE_HOST')}" if os.getenv('SPACE_HOST') else None)
+    if not url: return
     while True:
         try:
             time.sleep(600)
-            r = requests.get(url, timeout=15)
-            logger.info(f"Keep-alive ping sent (status: {r.status_code})")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping failed: {e}")
+            requests.get(url, timeout=15)
+        except: pass
 
-# --- 9. HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
+    def log_message(self, format, *args): pass
 
-def run_health_server():
-    port = int(os.getenv("PORT", 8080))
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        logger.info(f"✅ Health check server running on port {port}")
-        server.serve_forever()
-    except Exception as e:
-        logger.warning(f"Health server failed to start: {e}")
-
-# --- 10. MAIN ENTRY POINT ---
 def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.getenv("PORT", 8080))), HealthCheckHandler).serve_forever(), daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id_input))
 
-    print(f"🤖 Bot running with Full Chromium + Stealth (stealth available: {STEALTH_AVAILABLE})...")
+    print("🤖 Bot running with Timers displayed...")
     app.run_polling()
 
 if __name__ == "__main__":
