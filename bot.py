@@ -100,6 +100,13 @@ def update_account_timer(acc_id, next_run_time):
     conn.commit()
     conn.close()
 
+def update_account_timer_by_uid(user_id, account_id, next_run_time):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE accounts SET next_run = ? WHERE user_id = ? AND account_id = ?', (next_run_time, user_id, account_id))
+    conn.commit()
+    conn.close()
+
 # --- 4. HELPERS ---
 def make_progress_bar(percent, length=20):
     filled = int(length * percent // 100)
@@ -261,12 +268,10 @@ async def run_unlock_process(user_id, account_id, context, progress_message=None
 async def queue_worker(context):
     global queue_size
     while True:
-        # Wait for a task to arrive
         task = await unlock_queue.get()
         user_id, acc_id, chat_id, message_id, is_auto = task
         
         try:
-            # Create or fetch the progress message
             if is_auto:
                 msg_text = f"🔄 *Auto-unlocking:* `{acc_id}`... (Queue: 0)"
             else:
@@ -282,14 +287,13 @@ async def queue_worker(context):
             else:
                 progress_msg = await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode="Markdown")
 
-            # Run the browser
             success, timer_seconds = await run_unlock_process(user_id, acc_id, context, progress_msg)
             
-            # Handle results
             if success:
                 next_run = datetime.now() + timedelta(seconds=timer_seconds)
+                
                 if is_auto:
-                    # We need the db_id for updates, so we fetch it
+                    # Update the exact DB row
                     accounts = get_user_accounts(user_id)
                     for db_id, a_id, _ in accounts:
                         if a_id == acc_id:
@@ -297,16 +301,18 @@ async def queue_worker(context):
                             break
                     await progress_msg.edit_text(f"✅ *Auto-Unlock Success!*\n\n📌 ID: `{acc_id}`\n⏱️ Granted: {format_time_left(timer_seconds)}", parse_mode="Markdown")
                 else:
-                    added = add_account(user_id, acc_id, next_run.isoformat())
-                    if added:
-                        await progress_msg.edit_text(f"✅ *ID Added & Unlocked!*\n\n📌 ID: `{acc_id}`\n⏱️ Granted: {format_time_left(timer_seconds)}\n\nUse /start to manage.", parse_mode="Markdown")
-                    else:
-                        await progress_msg.edit_text(f"⚠️ ID `{acc_id}` is already in your list.")
+                    # Update the time for the manual addition
+                    update_account_timer_by_uid(user_id, acc_id, next_run.isoformat())
+                    await progress_msg.edit_text(f"✅ *ID Unlocked!*\n\n📌 ID: `{acc_id}`\n⏱️ Granted: {format_time_left(timer_seconds)}\n\nUse /start to manage.", parse_mode="Markdown")
             else:
+                # If it failed, set a retry timer of 5 minutes
+                fallback_time = datetime.now() + timedelta(minutes=5)
+                update_account_timer_by_uid(user_id, acc_id, fallback_time.isoformat())
+                
                 if is_auto:
-                    await progress_msg.edit_text(f"❌ *Auto-Unlock Failed* for `{acc_id}`. Retrying later.", parse_mode="Markdown")
+                    await progress_msg.edit_text(f"❌ *Auto-Unlock Failed* for `{acc_id}`. Retrying in 5 minutes.", parse_mode="Markdown")
                 else:
-                    await progress_msg.edit_text("❌ Failed to unlock this ID. Please try later.")
+                    await progress_msg.edit_text("❌ Failed to unlock this ID. Retrying in 5 minutes.", parse_mode="Markdown")
                     
         except Exception as e:
             logger.error(f"Queue worker error: {e}")
@@ -320,7 +326,6 @@ async def timer_loop(context):
         try:
             expired = get_expired_users()
             for db_id, user_id, account_id in expired:
-                # Put auto-unlocks in the queue
                 queue_size += 1
                 await unlock_queue.put((user_id, account_id, user_id, None, True))
         except Exception as e:
@@ -383,7 +388,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['awaiting_id'] = True
 
         elif data == "menu_list":
-            # The Refresh button hits this same block
             accounts = get_user_accounts(user_id)
             if not accounts:
                 await query.message.edit_text(
@@ -399,7 +403,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = []
             now = datetime.now()
             
-            # Recalculate based on fresh DB data
             for db_id, acc_id, next_run_str in accounts:
                 next_run = datetime.fromisoformat(next_run_str)
                 time_left_seconds = (next_run - now).total_seconds()
@@ -413,7 +416,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             except:
-                # Ignore Telegram errors if content is the same (e.g., spam clicking refresh)
                 pass
 
         elif data.startswith("rem_"):
@@ -456,14 +458,24 @@ async def process_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid ID. Please send a numeric ID (max 11 digits). Send /start to try again.")
         return
 
+    # --- CRITICAL FIX: Add to DB instantly with a temporary 10-minute timer ---
+    # This prevents the "Unlocking now..." glitch while it waits in the queue.
+    temp_time = datetime.now() + timedelta(minutes=10)
+    added = add_account(user_id, acc_id, temp_time.isoformat())
+    
+    if not added:
+        await update.message.reply_text(f"⚠️ ID `{acc_id}` is already in your list.")
+        return
+
     # Add to queue
     global queue_size
     queue_size += 1
     
-    # Send a temporary message
-    msg = await update.message.reply_text(f"⏳ *ID Added to Queue:* `{acc_id}`\n\nYou are number **#{queue_size}** in line. Please wait...", parse_mode="Markdown")
+    msg = await update.message.reply_text(
+        f"⏳ *ID Added to Queue:* `{acc_id}`\n\nYou are number **#{queue_size}** in line. Please wait...", 
+        parse_mode="Markdown"
+    )
     
-    # Put task in queue
     await unlock_queue.put((user_id, acc_id, update.effective_chat.id, msg.message_id, False))
 
 # --- 9. SERVER & MAIN ---
@@ -495,14 +507,13 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_id_input))
 
-    # Start the queue worker
     async def post_init(application):
         asyncio.create_task(queue_worker(application))
         asyncio.create_task(timer_loop(application))
         
     app.post_init = post_init
 
-    print("🤖 Bot running with Queue System...")
+    print("🤖 Bot running with Queue System & Set-Forget Logic...")
     app.run_polling()
 
 if __name__ == "__main__":
